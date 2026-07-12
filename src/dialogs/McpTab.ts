@@ -118,8 +118,8 @@ export class McpTab extends SettingsTab {
 					<span class="animate-spin inline-block">${icon(Loader2, "sm")}</span> Connecting…
 				</span>`;
 			case "auth-required":
-				return html`<span class="flex items-center gap-1 text-xs text-amber-600 dark:text-amber-500">
-					${icon(Lock, "sm")} Authorization required
+				return html`<span class="flex items-center gap-1 text-xs text-amber-600 dark:text-amber-500" title=${state.error ?? ""}>
+					${icon(Lock, "sm")} ${state.error ?? "Authorization required"}
 				</span>`;
 			case "error":
 				return html`<span class="flex items-center gap-1 text-xs text-destructive" title=${state.error ?? ""}>

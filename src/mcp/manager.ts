@@ -128,10 +128,17 @@ class McpManager {
 		this.setState(serverId, { status: "connecting", error: undefined });
 		try {
 			const headers = await this.buildHeaders(server);
+			console.log(
+				`[MCP] connecting "${server.name}" (${server.url}) auth=${server.authType} authHeader=${headers.Authorization ? "present" : "MISSING"}`,
+			);
 			const client = new McpClient({ url: server.url, headers });
 			const info = await client.initialize();
 			const tools = await client.listTools();
 			this.clients.set(serverId, client);
+			console.log(
+				`[MCP] connected "${server.name}" -> ${tools.length} tools:`,
+				tools.map((t) => t.name),
+			);
 			this.setState(serverId, {
 				status: "connected",
 				tools,
@@ -141,6 +148,7 @@ class McpManager {
 			});
 		} catch (err) {
 			this.clients.delete(serverId);
+			console.error(`[MCP] connect failed for "${server.name}":`, err);
 			if (err instanceof McpUnauthorizedError) {
 				// If we already sent a token and still got 401, the token was
 				// rejected (often an audience/resource mismatch) — surface that.

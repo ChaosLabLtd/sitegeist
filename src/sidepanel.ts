@@ -105,9 +105,7 @@ let agentUnsubscribe: (() => void) | undefined;
 let autoCompactor: AutoCompactor | undefined;
 let currentWindowId: number;
 
-// Non-MCP tools captured from the tools factory, so MCP tools can be merged in
-// live as servers connect without rebuilding the agent.
-let baseAgentTools: AgentTool<any>[] = [];
+// Unsubscribe from MCP connection-state changes when the agent is recreated.
 let mcpUnsubscribe: (() => void) | undefined;
 
 // Track which skills we've shown in full (skillName -> lastUpdated timestamp)
@@ -646,18 +644,22 @@ const createAgent = async (initialState?: Partial<AgentState>, shouldSave = true
 				tools.push(debuggerTool);
 			}
 
-			// Capture the non-MCP tools so MCP tools can be merged in live as
-			// servers connect (see subscribeMcpTools below).
-			baseAgentTools = tools;
+			// Return base tools now; MCP tools are merged in live via the
+			// subscription below (which reads the agent's full tool set, so the
+			// artifacts tool ChatPanel injects is preserved).
 			return [...tools, ...mcpManager.getAgentTools()];
 		},
 	});
 
-	// Keep the agent's tool list in sync with MCP connection state. As servers
-	// connect/disconnect, re-set tools to base + current MCP tools.
+	// Keep the agent's tool list in sync with MCP connection state. Capture the
+	// non-MCP tools from the agent's current state (includes the artifacts tool
+	// ChatPanel prepends), then re-set to base + current MCP tools.
 	mcpUnsubscribe = mcpManager.subscribe(() => {
 		if (!agent) return;
-		agent.setTools([...baseAgentTools, ...mcpManager.getAgentTools()]);
+		const mcpTools = mcpManager.getAgentTools();
+		const mcpNames = new Set(mcpTools.map((t) => t.name));
+		const nonMcp = (agent.state.tools ?? []).filter((t) => !t.name.startsWith("mcp_") && !mcpNames.has(t.name));
+		agent.setTools([...nonMcp, ...mcpTools]);
 	});
 	// Connect enabled servers in the background; tools appear as they resolve.
 	mcpManager.connectAll().catch((err) => console.error("Failed to connect MCP servers:", err));
