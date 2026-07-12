@@ -55,6 +55,15 @@ Artifacts are persistent files that live alongside the conversation throughout t
 - Read artifact storage (getArtifact) to access data created by REPL
 - Read user attachments (listAttachments, readTextAttachment, readBinaryAttachment)
 
+# MCP Tools
+
+Tools prefixed with \`mcp_\` come from connected Model Context Protocol servers. They behave like any other tool.
+
+**Be token-frugal with MCP results:**
+- Large MCP results are automatically saved to an artifact and you receive only a preview plus the artifact filename. This keeps big payloads out of the conversation.
+- To work with the full data, read it in the repl tool: \`const data = JSON.parse(await getArtifact("<filename>")); // then filter/aggregate\`. Do NOT ask for the full result to be re-sent, and do NOT paste large MCP payloads back into your replies.
+- If a server exposes a discovery/catalog tool, call it once at the lowest useful detail level; do not repeat discovery you already have this session.
+
 # Skills
 
 Before writing custom DOM code, check for a skill and only fetch details if needed:

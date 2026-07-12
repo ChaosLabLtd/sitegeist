@@ -598,7 +598,9 @@ const createAgent = async (initialState?: Partial<AgentState>, shouldSave = true
 			if (!agent) return;
 			SessionCostDialog.open(agent.state.messages);
 		},
-		toolsFactory: (_agent, _agentInterface, _artifactsPanel, runtimeProvidersFactory) => {
+		toolsFactory: (_agent, _agentInterface, artifactsPanel, runtimeProvidersFactory) => {
+			// Let MCP spill large tool results into the artifacts panel.
+			mcpManager.setArtifactsSink(artifactsPanel);
 			const navigateTool = new NavigateTool();
 			const selectElementTool = new AskUserWhichElementTool();
 

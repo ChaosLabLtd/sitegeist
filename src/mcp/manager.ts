@@ -42,10 +42,28 @@ export function mcpToolName(server: McpServerConfig, toolName: string): string {
 	return `mcp_${slug(server.name) || server.id.slice(0, 8)}_${slug(toolName)}`;
 }
 
+/**
+ * Minimal artifacts sink the manager uses to spill large results. Matches the
+ * ArtifactsPanel tool interface so results can be written and later read back
+ * by the agent via the REPL without living in message history.
+ */
+export interface McpArtifactsSink {
+	artifacts: Map<string, { content: string }>;
+	tool: {
+		execute: (toolCallId: string, args: { command: string; filename: string; content?: string }) => Promise<unknown>;
+	};
+}
+
 class McpManager {
 	private readonly states = new Map<string, McpConnectionState>();
 	private readonly clients = new Map<string, McpClient>();
 	private listeners = new Set<() => void>();
+	private artifactsSink?: McpArtifactsSink;
+
+	/** Wire the artifacts panel so large tool results can be spilled to files. */
+	setArtifactsSink(sink: McpArtifactsSink | undefined): void {
+		this.artifactsSink = sink;
+	}
 
 	subscribe(fn: () => void): () => void {
 		this.listeners.add(fn);
@@ -237,6 +255,48 @@ class McpManager {
 		return tools;
 	}
 
+	// Results larger than this many characters are spilled to an artifact.
+	private static readonly SPILL_THRESHOLD = 2000;
+
+	/**
+	 * If the combined text content is large, write it to a session artifact and
+	 * return a compact preview that points the agent at the artifact. The agent
+	 * can then read/query it via the REPL (`artifacts.read`) instead of carrying
+	 * the full payload in every subsequent turn.
+	 */
+	private async maybeSpill(
+		server: McpServerConfig,
+		def: McpToolDef,
+		content: (TextContent | ImageContent)[],
+	): Promise<(TextContent | ImageContent)[]> {
+		const sink = this.artifactsSink;
+		if (!sink) return content;
+
+		// Only spill plain-text content; leave images and small results intact.
+		const nonText = content.filter((c) => c.type !== "text");
+		const text = content
+			.filter((c): c is TextContent => c.type === "text")
+			.map((c) => c.text)
+			.join("\n");
+		if (text.length < McpManager.SPILL_THRESHOLD) return content;
+
+		const stamp = new Date().toISOString().replace(/[:.]/g, "-");
+		const filename = `${slug(server.name)}-${slug(def.name)}-${stamp}.json`;
+		try {
+			await sink.tool.execute(crypto.randomUUID(), { command: "create", filename, content: text });
+		} catch (err) {
+			console.error("[MCP] failed to spill result to artifact:", err);
+			return content;
+		}
+
+		const preview = text.slice(0, 800);
+		const summary =
+			`Result from ${server.name}:${def.name} was large (${text.length} chars) and saved to artifact "${filename}".\n` +
+			`To read or query the full data, use the repl tool: const data = JSON.parse(await getArtifact("${filename}")). Do NOT ask for the full text to be re-sent.\n\n` +
+			`Preview (first 800 chars):\n${preview}${text.length > 800 ? "\n…(truncated)" : ""}`;
+		return [{ type: "text", text: summary }, ...nonText];
+	}
+
 	private buildAgentTool(
 		server: McpServerConfig,
 		client: McpClient,
@@ -256,8 +316,11 @@ class McpManager {
 					const text = content.map((c) => (c.type === "text" ? c.text : "[non-text content]")).join("\n");
 					throw new Error(text || `MCP tool ${def.name} returned an error`);
 				}
+				// Spill large text results to an artifact and return a compact
+				// preview, so the full payload does not live in message history.
+				const spilled = await this.maybeSpill(server, def, content);
 				return {
-					content,
+					content: spilled,
 					details: {
 						serverId: server.id,
 						serverName: server.name,
