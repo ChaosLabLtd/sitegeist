@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-07-12
+
 ### Added
 
 - Model Context Protocol (MCP) support: connect remote MCP servers over Streamable HTTP and use their tools directly in chat
