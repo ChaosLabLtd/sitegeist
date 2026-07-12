@@ -662,6 +662,25 @@ const createAgent = async (initialState?: Partial<AgentState>, shouldSave = true
 	// Connect enabled servers in the background; tools appear as they resolve.
 	mcpManager.connectAll().catch((err) => console.error("Failed to connect MCP servers:", err));
 
+	// Debug hook: inspect live MCP state from the side panel DevTools console
+	// via `__mcp()`. Reports each server's status and the tool names the agent
+	// currently sees.
+	(window as unknown as { __mcp: () => void }).__mcp = () => {
+		console.table(
+			mcpManager.getStates().map((s) => ({
+				name: s.config.name,
+				status: s.status,
+				tools: s.tools.length,
+				error: s.error ?? "",
+			})),
+		);
+		console.log(
+			"Agent MCP tools:",
+			mcpManager.getAgentTools().map((t) => t.name),
+		);
+		console.log("Agent total tools:", agent?.state.tools?.length ?? 0);
+	};
+
 	// Register custom message renderers after agentInterface is available
 	if (chatPanel.agentInterface) {
 		registerWelcomeRenderer(agent, chatPanel.agentInterface);
