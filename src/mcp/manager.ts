@@ -142,10 +142,13 @@ class McpManager {
 		} catch (err) {
 			this.clients.delete(serverId);
 			if (err instanceof McpUnauthorizedError) {
+				// If we already sent a token and still got 401, the token was
+				// rejected (often an audience/resource mismatch) — surface that.
+				const hadToken = server.authType === "oauth" && !!server.oauth?.accessToken;
 				this.setState(serverId, {
 					status: "auth-required",
 					tools: [],
-					error: "Authorization required",
+					error: hadToken ? "Server rejected the access token — re-authenticate" : "Authorization required",
 				});
 			} else {
 				this.setState(serverId, {

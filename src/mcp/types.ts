@@ -13,8 +13,10 @@ export type McpAuthType = "none" | "bearer" | "oauth";
  * Persisted so tokens survive reloads and can be refreshed.
  */
 export interface McpOAuthState {
-	/** Canonical resource identifier (the MCP server URL) used for RFC 8707. */
+	/** Canonical resource identifier (RFC 8707), only when advertised via PRM. */
 	resource?: string;
+	/** True when `resource` came from Protected Resource Metadata (safe to send). */
+	resourceConfirmed?: boolean;
 	/** Authorization server issuer base URL. */
 	issuer?: string;
 	authorizationEndpoint?: string;

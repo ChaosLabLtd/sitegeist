@@ -28,13 +28,39 @@ const CLIENT_NAME = "Sitegeist";
 // Refresh access tokens this many ms before they actually expire.
 const EXPIRY_MARGIN_MS = 60_000;
 
+/**
+ * Extract an OAuth error code (e.g. "invalid_target") from a response body,
+ * whether JSON or otherwise. Returns undefined if none is present.
+ */
+function oauthErrorCode(body: string): string | undefined {
+	try {
+		const parsed: unknown = JSON.parse(body);
+		if (parsed && typeof parsed === "object" && "error" in parsed) {
+			const code = (parsed as { error: unknown }).error;
+			if (typeof code === "string") return code;
+		}
+	} catch {
+		// Not JSON.
+	}
+	return undefined;
+}
+
+/**
+ * Fetch and parse a JSON body. Throws a readable error (never a raw
+ * "Unexpected token '<'") when the endpoint returns HTML or an OAuth error.
+ */
 async function fetchJson(url: string, init?: RequestInit): Promise<unknown> {
 	const res = await fetch(url, init);
+	const body = await res.text().catch(() => "");
 	if (!res.ok) {
-		const text = await res.text().catch(() => "");
-		throw new Error(`${res.status} ${res.statusText}${text ? `: ${text}` : ""}`);
+		const code = oauthErrorCode(body);
+		throw new Error(code ? code : `${res.status} ${res.statusText}${body ? `: ${body.slice(0, 200)}` : ""}`);
 	}
-	return res.json();
+	try {
+		return JSON.parse(body);
+	} catch {
+		throw new Error(`Expected JSON from ${new URL(url).host} but received a non-JSON response`);
+	}
 }
 
 /**
@@ -82,6 +108,9 @@ function authServerMetadataUrls(issuer: string): string[] {
  * with endpoints filled in; throws if discovery fails entirely.
  */
 export async function discoverOAuth(serverUrl: string, wwwAuthenticate?: string | null): Promise<McpOAuthState> {
+	// Default resource to the server URL, but do NOT mark it confirmed: many
+	// auth servers reject an unknown `resource` with invalid_target, so we only
+	// send it when Protected Resource Metadata explicitly advertises it.
 	const state: McpOAuthState = { resource: serverUrl };
 
 	// Step 1: Protected Resource Metadata (best effort).
@@ -91,6 +120,8 @@ export async function discoverOAuth(serverUrl: string, wwwAuthenticate?: string 
 			const prm = await fetchJson(url);
 			if (!Value.Check(ProtectedResourceMetadataSchema, prm)) continue;
 			if (prm.resource) state.resource = prm.resource;
+			// PRM was served, so the resource indicator is expected by this AS.
+			state.resourceConfirmed = true;
 			if (prm.authorization_servers?.[0]) {
 				issuer = prm.authorization_servers[0];
 			}
@@ -169,6 +200,33 @@ function applyTokenResponse(state: McpOAuthState, token: unknown): void {
 }
 
 /**
+ * POST to the token endpoint. Sends the RFC 8707 `resource` parameter only when
+ * it was confirmed via Protected Resource Metadata; if the AS still rejects it
+ * with invalid_target, retries once without it.
+ */
+async function requestToken(state: McpOAuthState, baseBody: Record<string, string>): Promise<unknown> {
+	const withResource = { ...baseBody };
+	if (state.resource && state.resourceConfirmed) withResource.resource = state.resource;
+
+	try {
+		return await fetchJson(state.tokenEndpoint!, {
+			method: "POST",
+			headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams(withResource).toString(),
+		});
+	} catch (err) {
+		const isInvalidTarget = err instanceof Error && err.message.includes("invalid_target");
+		if (!isInvalidTarget || !("resource" in withResource)) throw err;
+		// Retry without the resource indicator.
+		return fetchJson(state.tokenEndpoint!, {
+			method: "POST",
+			headers: { "Content-Type": "application/x-www-form-urlencoded" },
+			body: new URLSearchParams(baseBody).toString(),
+		});
+	}
+}
+
+/**
  * Run the full interactive OAuth authorization flow. Opens a browser tab for
  * user consent and returns fully populated OAuth state with tokens.
  */
@@ -190,7 +248,7 @@ export async function authorize(serverUrl: string, existing?: McpOAuthState): Pr
 		state: csrf,
 	});
 	if (state.scope) authParams.set("scope", state.scope);
-	if (state.resource) authParams.set("resource", state.resource);
+	if (state.resource && state.resourceConfirmed) authParams.set("resource", state.resource);
 
 	const redirectUrl = await waitForOAuthRedirect(
 		`${state.authorizationEndpoint}?${authParams.toString()}`,
@@ -212,13 +270,8 @@ export async function authorize(serverUrl: string, existing?: McpOAuthState): Pr
 		code_verifier: verifier,
 	};
 	if (state.clientSecret) tokenBody.client_secret = state.clientSecret;
-	if (state.resource) tokenBody.resource = state.resource;
 
-	const token = await fetchJson(state.tokenEndpoint!, {
-		method: "POST",
-		headers: { "Content-Type": "application/x-www-form-urlencoded" },
-		body: new URLSearchParams(tokenBody).toString(),
-	});
+	const token = await requestToken(state, tokenBody);
 	applyTokenResponse(state, token);
 	return state;
 }
@@ -236,13 +289,8 @@ export async function refreshToken(state: McpOAuthState): Promise<McpOAuthState>
 		client_id: state.clientId,
 	};
 	if (state.clientSecret) body.client_secret = state.clientSecret;
-	if (state.resource) body.resource = state.resource;
 
-	const token = await fetchJson(state.tokenEndpoint, {
-		method: "POST",
-		headers: { "Content-Type": "application/x-www-form-urlencoded" },
-		body: new URLSearchParams(body).toString(),
-	});
+	const token = await requestToken(state, body);
 	const updated = { ...state };
 	applyTokenResponse(updated, token);
 	return updated;
