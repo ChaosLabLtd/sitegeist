@@ -1,5 +1,7 @@
 import type { AgentMessage } from "@mariozechner/pi-agent-core";
 import type { Message } from "@mariozechner/pi-ai";
+import { convertAttachments } from "@mariozechner/pi-web-ui";
+import type { CompactionSummaryMessage } from "../auto-compact.js";
 import type { NavigationMessage } from "./NavigationMessage.js";
 
 // Helper: Check if a message has toolCall blocks
@@ -84,11 +86,32 @@ export async function browserMessageTransformer(messages: AgentMessage[]): Promi
 		}
 
 		// Filter non-LLM messages
-		if (m.role !== "user" && m.role !== "assistant" && m.role !== "toolResult" && m.role !== "navigation") {
+		if (
+			m.role !== "user" &&
+			m.role !== "user-with-attachments" &&
+			m.role !== "assistant" &&
+			m.role !== "toolResult" &&
+			m.role !== "navigation" &&
+			m.role !== "compactionSummary"
+		) {
 			continue;
 		}
 
-		if (m.role === "navigation") {
+		if (m.role === "compactionSummary") {
+			const summary = m as CompactionSummaryMessage;
+			transformed.push({
+				role: "user",
+				content: `<conversation-summary>
+${summary.summary}
+</conversation-summary>
+
+<instructions>
+This summary replaces earlier compacted context. Use it as continuity context and continue from the recent messages below.
+Do not repeat the summary back to the user.
+</instructions>`,
+				timestamp: summary.timestamp,
+			} as Message);
+		} else if (m.role === "navigation") {
 			const nav = m as NavigationMessage;
 			const tabInfo = nav.tabId !== undefined ? ` (tab id: ${nav.tabId})` : "";
 
@@ -114,6 +137,17 @@ ${skillsInfo}
 		} else if (m.role === "user") {
 			const { attachments, ...rest } = m as any;
 			transformed.push(rest as Message);
+		} else if (m.role === "user-with-attachments") {
+			const user = m as any;
+			const content = typeof user.content === "string" ? [{ type: "text", text: user.content }] : [...user.content];
+			if (user.attachments) {
+				content.push(...convertAttachments(user.attachments));
+			}
+			transformed.push({
+				role: "user",
+				content,
+				timestamp: user.timestamp,
+			} as Message);
 		} else {
 			transformed.push(m as Message);
 		}

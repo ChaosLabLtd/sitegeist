@@ -2,6 +2,12 @@
 
 ## [Unreleased]
 
+### Added
+
+- Model Context Protocol (MCP) support: connect remote MCP servers over Streamable HTTP and use their tools directly in chat
+- Visual "MCP Servers" settings tab to add, enable/disable, authenticate, and inspect discovered tools per server
+- MCP authentication via bearer token, custom headers, and full OAuth 2.1 (metadata discovery, dynamic client registration, PKCE)
+
 ## [1.0.0] - 2026-03-15
 
 ### Added

@@ -14,7 +14,7 @@ import {
 	ChatPanel,
 	createExtractDocumentTool,
 	createStreamFn,
-	ModelSelector,
+	ProvidersModelsTab,
 	ProxyTab,
 	SettingsDialog,
 	// PersistentStorageDialog,
@@ -23,16 +23,25 @@ import {
 } from "@mariozechner/pi-web-ui";
 import { html, render } from "lit";
 import { History, Plus, Settings } from "lucide";
+import { AutoCompactor, DEFAULT_AUTO_COMPACT_SETTINGS, registerAutoCompactRenderer } from "./auto-compact.js";
+import {
+	CLIPROXY_OPUS_MODEL_ID,
+	CLIPROXY_PROVIDER_ID,
+	createClipProxyProvider,
+	fetchClipProxyModelInfos,
+} from "./cliproxy.js";
 import { AboutTab } from "./dialogs/AboutTab.js";
 import { ApiKeyOrOAuthDialog } from "./dialogs/ApiKeyOrOAuthDialog.js";
 import { ApiKeysOAuthTab } from "./dialogs/ApiKeysOAuthTab.js";
 import { CostsTab } from "./dialogs/CostsTab.js";
+import { McpTab } from "./dialogs/McpTab.js";
 import { SessionCostDialog } from "./dialogs/SessionCostDialog.js";
 import { SitegeistSessionListDialog } from "./dialogs/SessionListDialog.js";
 import { SkillsTab } from "./dialogs/SkillsTab.js";
 import { UpdateNotificationDialog } from "./dialogs/UpdateNotificationDialog.js";
 import { UserScriptsPermissionDialog } from "./dialogs/UserScriptsPermissionDialog.js";
 import { WelcomeSetupDialog } from "./dialogs/WelcomeSetupDialog.js";
+import { mcpManager } from "./mcp/manager.js";
 import { browserMessageTransformer } from "./messages/message-transformer.js";
 import {
 	createNavigationMessage,
@@ -59,6 +68,7 @@ import { tutorials } from "./tutorials.js";
 // Register custom message renderers
 registerNavigationRenderer();
 registerExtractImageRenderer();
+registerAutoCompactRenderer();
 
 // Listen for abort messages from REPL overlay
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -92,7 +102,13 @@ let isEditingTitle = false;
 let agent: Agent;
 let chatPanel: ChatPanel;
 let agentUnsubscribe: (() => void) | undefined;
+let autoCompactor: AutoCompactor | undefined;
 let currentWindowId: number;
+
+// Non-MCP tools captured from the tools factory, so MCP tools can be merged in
+// live as servers connect without rebuilding the agent.
+let baseAgentTools: AgentTool<any>[] = [];
+let mcpUnsubscribe: (() => void) | undefined;
 
 // Track which skills we've shown in full (skillName -> lastUpdated timestamp)
 // Reset when a new session/agent is created
@@ -110,6 +126,7 @@ const DEFAULT_MODELS: Record<string, string> = {
 	anthropic: "claude-sonnet-4-6",
 	"azure-openai-responses": "gpt-5.2",
 	cerebras: "zai-glm-4.6",
+	[CLIPROXY_PROVIDER_ID]: "gpt-5.5",
 	"github-copilot": "gpt-4o",
 	google: "gemini-2.5-flash",
 	"google-antigravity": "gemini-3.1-pro-high",
@@ -139,7 +156,7 @@ async function selectDefaultModelForAvailableProvider() {
 	for (const provider of providers) {
 		const modelId = DEFAULT_MODELS[provider];
 		if (modelId) {
-			const model = getModel(provider as any, modelId);
+			const model = await getConfiguredModel(provider, modelId);
 			if (model) {
 				agent.setModel(model);
 				await storage.settings.set("lastUsedModel", model);
@@ -152,10 +169,10 @@ async function selectDefaultModelForAvailableProvider() {
 
 	// If no default found, try the first model for the first provider with a key
 	for (const provider of providers) {
-		const models = getModels(provider as any);
-		if (models.length > 0) {
-			agent.setModel(models[0]);
-			await storage.settings.set("lastUsedModel", models[0]);
+		const model = await getFirstConfiguredModel(provider);
+		if (model) {
+			agent.setModel(model);
+			await storage.settings.set("lastUsedModel", model);
 			await updateAuthLabel();
 			renderApp();
 			return;
@@ -170,21 +187,90 @@ async function getProvidersWithKeys(): Promise<string[]> {
 		const key = await storage.providerKeys.get(provider);
 		if (key) result.push(provider);
 	}
+	const customProviders = await storage.customProviders.getAll();
+	for (const provider of customProviders) {
+		if (!result.includes(provider.name)) result.push(provider.name);
+	}
 	return result;
 }
 
 async function hasAnyApiKey(): Promise<boolean> {
 	const providers = await storage.providerKeys.list();
-	return providers.length > 0;
+	if (providers.length > 0) return true;
+	return (await storage.customProviders.getAll()).length > 0;
+}
+
+async function getCustomProvider(providerName: string) {
+	const customProviders = await storage.customProviders.getAll();
+	return customProviders.find((provider) => provider.name === providerName || provider.id === providerName);
+}
+
+async function getConfiguredModel(provider: string, modelId: string): Promise<Model<any> | undefined> {
+	const knownModel = getModel(provider as any, modelId as any) as Model<any> | undefined;
+	if (knownModel) return knownModel;
+	const customProvider = await getCustomProvider(provider);
+	return customProvider?.models?.find((model) => model.id === modelId);
+}
+
+async function getFirstConfiguredModel(provider: string): Promise<Model<any> | undefined> {
+	const knownModels = getModels(provider as any) as Model<any>[];
+	if (knownModels.length > 0) return knownModels[0];
+	const customProvider = await getCustomProvider(provider);
+	return customProvider?.models?.[0];
+}
+
+async function ensureClipProxyProvider(): Promise<void> {
+	const existing = await storage.customProviders.get(CLIPROXY_PROVIDER_ID);
+	let provider = createClipProxyProvider(existing);
+	try {
+		const modelInfos = await fetchClipProxyModelInfos(provider.baseUrl);
+		provider = createClipProxyProvider(existing, modelInfos);
+	} catch (error) {
+		console.warn("Failed to discover ClipProxy models, using fallback models:", error);
+	}
+	await storage.customProviders.set(provider);
+
+	const lastUsedModel = await storage.settings.get<Model<any>>("lastUsedModel");
+	if (lastUsedModel?.provider === provider.name && lastUsedModel.id === "claude-opus-4.7") {
+		const migratedModel = provider.models?.find((model) => model.id === CLIPROXY_OPUS_MODEL_ID);
+		if (migratedModel) {
+			await storage.settings.set("lastUsedModel", migratedModel);
+		}
+	}
+}
+
+async function resolveProviderApiKey(provider: string): Promise<string | undefined> {
+	const stored = await storage.providerKeys.get(provider);
+	if (!stored) {
+		const customProvider = await getCustomProvider(provider);
+		return customProvider ? customProvider.apiKey || "dummy" : undefined;
+	}
+	const proxyEnabled = await storage.settings.get<boolean>("proxy.enabled");
+	const proxyUrl = proxyEnabled ? (await storage.settings.get<string>("proxy.url")) || undefined : undefined;
+	return resolveApiKey(stored, provider, storage.providerKeys, proxyUrl);
+}
+
+async function getAutoCompactSettings() {
+	const enabled = await storage.settings.get<boolean>("autoCompact.enabled");
+	const reserveTokens = await storage.settings.get<number>("autoCompact.reserveTokens");
+	const keepRecentTokens = await storage.settings.get<number>("autoCompact.keepRecentTokens");
+
+	return {
+		enabled: enabled ?? DEFAULT_AUTO_COMPACT_SETTINGS.enabled,
+		reserveTokens: reserveTokens ?? DEFAULT_AUTO_COMPACT_SETTINGS.reserveTokens,
+		keepRecentTokens: keepRecentTokens ?? DEFAULT_AUTO_COMPACT_SETTINGS.keepRecentTokens,
+	};
 }
 
 function openApiKeysDialog(): Promise<void> {
-	return new Promise((resolve) => {
-		SettingsDialog.open(
-			[new ApiKeysOAuthTab(), new CostsTab(), new SkillsTab(), new ProxyTab(), new AboutTab()],
-			resolve,
-		);
-	});
+	return SettingsDialog.open([
+		new ApiKeysOAuthTab(),
+		new ProvidersModelsTab(),
+		new CostsTab(),
+		new SkillsTab(),
+		new ProxyTab(),
+		new AboutTab(),
+	]);
 }
 
 async function updateAuthLabel() {
@@ -195,7 +281,8 @@ async function updateAuthLabel() {
 	const provider = agent.state.model.provider;
 	const stored = await storage.providerKeys.get(provider);
 	if (!stored) {
-		authLabel = "";
+		const customProvider = await getCustomProvider(provider);
+		authLabel = customProvider ? (customProvider.baseUrl.includes("localhost") ? "local" : "custom") : "";
 	} else if (isOAuthCredentials(stored)) {
 		authLabel = "subscription";
 	} else {
@@ -330,6 +417,14 @@ const createAgent = async (initialState?: Partial<AgentState>, shouldSave = true
 	if (agentUnsubscribe) {
 		agentUnsubscribe();
 	}
+	if (mcpUnsubscribe) {
+		mcpUnsubscribe();
+		mcpUnsubscribe = undefined;
+	}
+	if (autoCompactor) {
+		autoCompactor.destroy();
+		autoCompactor = undefined;
+	}
 
 	// Mark all loaded messages as already recorded (by object identity)
 	for (const msg of initialState?.messages || []) {
@@ -364,7 +459,7 @@ const createAgent = async (initialState?: Partial<AgentState>, shouldSave = true
 			for (const provider of providersWithKeys) {
 				const modelId = DEFAULT_MODELS[provider];
 				if (modelId) {
-					const model = getModel(provider as any, modelId);
+					const model = await getConfiguredModel(provider, modelId);
 					if (model) {
 						defaultModel = model;
 						break;
@@ -393,12 +488,16 @@ const createAgent = async (initialState?: Partial<AgentState>, shouldSave = true
 			if (!enabled) return undefined;
 			return (await storage.settings.get<string>("proxy.url")) || undefined;
 		}),
-		getApiKey: async (provider: string) => {
-			const stored = await storage.providerKeys.get(provider);
-			if (!stored) return undefined;
-			const proxyEnabled = await storage.settings.get<boolean>("proxy.enabled");
-			const proxyUrl = proxyEnabled ? (await storage.settings.get<string>("proxy.url")) || undefined : undefined;
-			return resolveApiKey(stored, provider, storage.providerKeys, proxyUrl);
+		getApiKey: resolveProviderApiKey,
+	});
+
+	autoCompactor = new AutoCompactor({
+		agent,
+		getApiKey: resolveProviderApiKey,
+		getSettings: getAutoCompactSettings,
+		onCompacted: async () => {
+			await saveSession();
+			renderApp();
 		},
 	});
 
@@ -462,27 +561,13 @@ const createAgent = async (initialState?: Partial<AgentState>, shouldSave = true
 			return chrome.runtime.getURL("sandbox.html");
 		},
 		onApiKeyRequired: async (provider: string) => {
+			const customProvider = await getCustomProvider(provider);
+			if (customProvider) return true;
 			return await ApiKeyOrOAuthDialog.prompt(provider);
-		},
-		onModelSelect: async () => {
-			const providers = await getProvidersWithKeys();
-			if (providers.length === 0) {
-				openApiKeysDialog();
-				return;
-			}
-			ModelSelector.open(
-				agent.state.model,
-				(model) => {
-					agent.setModel(model);
-					chatPanel.agentInterface?.requestUpdate();
-					updateAuthLabel().catch(() => {});
-					renderApp();
-				},
-				providers,
-			);
 		},
 		onBeforeSend: async () => {
 			if (!agent) return;
+			await autoCompactor?.compactIfNeeded();
 
 			// Get current tab info
 			const [tab] = await chrome.tabs.query({
@@ -561,9 +646,21 @@ const createAgent = async (initialState?: Partial<AgentState>, shouldSave = true
 				tools.push(debuggerTool);
 			}
 
-			return tools;
+			// Capture the non-MCP tools so MCP tools can be merged in live as
+			// servers connect (see subscribeMcpTools below).
+			baseAgentTools = tools;
+			return [...tools, ...mcpManager.getAgentTools()];
 		},
 	});
+
+	// Keep the agent's tool list in sync with MCP connection state. As servers
+	// connect/disconnect, re-set tools to base + current MCP tools.
+	mcpUnsubscribe = mcpManager.subscribe(() => {
+		if (!agent) return;
+		agent.setTools([...baseAgentTools, ...mcpManager.getAgentTools()]);
+	});
+	// Connect enabled servers in the background; tools appear as they resolve.
+	mcpManager.connectAll().catch((err) => console.error("Failed to connect MCP servers:", err));
 
 	// Register custom message renderers after agentInterface is available
 	if (chatPanel.agentInterface) {
@@ -705,6 +802,7 @@ const renderApp = () => {
 								new ApiKeysOAuthTab(),
 								new CostsTab(),
 								new SkillsTab(),
+								new McpTab(),
 								new ProxyTab(),
 								new AboutTab(),
 							]),
@@ -948,6 +1046,7 @@ async function initApp() {
 
 	// Proxy disabled — CORS is handled locally via declarativeNetRequest rules
 	await storage.settings.set("proxy.enabled", false);
+	await ensureClipProxyProvider();
 
 	// Create ChatPanel
 	chatPanel = new ChatPanel();

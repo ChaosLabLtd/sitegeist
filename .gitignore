@@ -5,6 +5,8 @@ site/data/
 *.log
 .DS_Store
 sitegeist-latest.zip
+sitegeist-mcp.zip
+.npm-cache/
 .playwright-mcp/
 *.screenflow/
 *.mp4
